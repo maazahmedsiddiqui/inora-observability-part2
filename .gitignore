@@ -1,3 +1,6 @@
 venv/
 __pycache__/
 app.log
+logs/
+.pytest_cache/
+*.db
