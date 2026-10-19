@@ -1,0 +1,13 @@
+filebeat.inputs:
+- type: filestream
+  id: inora-app-logs
+  enabled: true
+  paths:
+    - /usr/share/filebeat/app.log
+  parsers:
+    - ndjson:
+        target: ""
+        add_error_key: true
+
+output.elasticsearch:
+  hosts: ["elasticsearch:9200"]
