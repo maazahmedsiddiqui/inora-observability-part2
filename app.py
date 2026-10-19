@@ -41,6 +41,9 @@ if not any(isinstance(h, logging.FileHandler) for h in root_logger.handlers):
     file_handler.setFormatter(JsonFormatter())
     root_logger.addHandler(file_handler)
 root_logger.setLevel(logging.INFO)
+# Werkzeug's own access-log lines (one per Prometheus scrape) have no request_id/trace_id; the
+# app writes its own structured line per request, so silence the duplicate.
+logging.getLogger("werkzeug").setLevel(logging.WARNING)
 
 # ---------------- Prometheus Metrics (Fixed A1 gaps + bounded labels) ----------------
 HTTP_BUCKETS = (0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0)
@@ -373,8 +376,10 @@ def create_app(db_path=None, rate_limit=None, rate_window=None):
 
     @app.route("/orders/<order_id>/cancellations", methods=["POST"])
     def cancel_order(order_id):
+        was_placed = store.get_order(order_id)["status"] == "placed"
         order = store.cancel_order(order_id)
-        BUSINESS_ORDERS.labels("cancelled").inc()
+        if was_placed:  # repeating a cancel is safe and must not inflate the metric
+            BUSINESS_ORDERS.labels("cancelled").inc()
         logging.info(
             f"Order {order_id} cancelled",
             extra={

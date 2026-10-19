@@ -1,5 +1,6 @@
 import re
 import pytest
+from prometheus_client import REGISTRY
 
 from app import create_app
 
@@ -172,3 +173,18 @@ def test_missing_json_content_type_returns_400_problem_json(client):
     assert r.status_code == 400
     assert r.get_json()["code"] == "validation_error"
 
+
+
+# ---- Metrics: a repeated cancel must not be counted twice ----
+def test_repeated_cancel_counts_once_in_business_metric(client):
+    def cancelled():
+        return REGISTRY.get_sample_value("business_orders_total", {"status": "cancelled"}) or 0.0
+
+    placed = client.post(
+        "/orders",
+        json={"product_id": "pearl-bracelet", "quantity": 1, "payment_token": "tok_visa"},
+    ).get_json()
+    before = cancelled()
+    client.post(f"/orders/{placed['id']}/cancellations")
+    client.post(f"/orders/{placed['id']}/cancellations")
+    assert cancelled() - before == 1
