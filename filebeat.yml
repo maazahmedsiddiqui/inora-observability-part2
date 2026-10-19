@@ -3,7 +3,7 @@ filebeat.inputs:
   id: inora-app-logs
   enabled: true
   paths:
-    - /usr/share/filebeat/app.log
+    - /usr/share/filebeat/logs/*.log
   parsers:
     - ndjson:
         target: ""

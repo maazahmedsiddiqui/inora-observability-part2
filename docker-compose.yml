@@ -1,6 +1,14 @@
-version: '3.8'
-
 services:
+  api:
+    build: .
+    container_name: inora-api
+    ports:
+      - "5000:5000"
+    environment:
+      - LOG_FILE=/app/logs/app.log
+    volumes:
+      - ./logs:/app/logs
+
   prometheus:
     image: prom/prometheus:latest
     container_name: prometheus
@@ -56,6 +64,6 @@ services:
     command: ["-e", "--strict.perms=false"]
     volumes:
       - ./filebeat.yml:/usr/share/filebeat/filebeat.yml:ro
-      - ./app.log:/usr/share/filebeat/app.log:ro
+      - ./logs:/usr/share/filebeat/logs:ro
     depends_on:
       - elasticsearch

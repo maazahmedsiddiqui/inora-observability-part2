@@ -1,4 +1,5 @@
 import json
+import os
 import uuid
 import random
 import time
@@ -16,7 +17,9 @@ class JsonFormatter(logging.Formatter):
             "request_id": getattr(record, "request_id", "n/a")
         })
 
-handler = logging.FileHandler("app.log")
+LOG_FILE = os.environ.get("LOG_FILE", "app.log")
+os.makedirs(os.path.dirname(LOG_FILE) or ".", exist_ok=True)
+handler = logging.FileHandler(LOG_FILE)
 handler.setFormatter(JsonFormatter())
 logging.getLogger().addHandler(handler)
 logging.getLogger().setLevel(logging.INFO)
