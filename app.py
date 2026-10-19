@@ -320,7 +320,9 @@ def create_app(db_path=None, rate_limit=None, rate_window=None):
                 "service_unavailable",
             )
         if fault == "slow":
-            time.sleep(1.5)
+            # Longer than the caller's 2.0s timeout, shorter than timeout + first backoff (3.0s), so the
+            # slow request finishes on the server BEFORE the caller's retry arrives (a clean replay).
+            time.sleep(float(os.environ.get("FAULT_SLOW_SECONDS", "2.5")))
 
         # 3. Validate JSON Payload
         if not request.is_json:
