@@ -1,0 +1,313 @@
+openapi: 3.0.3
+info:
+  title: Inora Jewelry E-Commerce HTTP API
+  version: 2.0.0
+  description: >
+    RESTful HTTP API for the Inora minimalist jewelry store (ESD Assignment 2).
+    Demonstrates resource-oriented URIs, input validation, RFC 7807 Problem Details
+    (application/problem+json), Idempotency-Key support on order creation, per-IP
+    fixed-window rate limiting, and W3C traceparent correlation.
+servers:
+  - url: http://localhost:5000
+    description: Local Docker Compose HTTP API container
+
+paths:
+  /products:
+    get:
+      summary: List all jewelry products in the catalog
+      operationId: listProducts
+      responses:
+        "200":
+          description: A list of products with prices in PKR and current stock
+          headers:
+            traceparent:
+              $ref: "#/components/headers/Traceparent"
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/Product"
+
+  /products/{product_id}:
+    get:
+      summary: Get a single product by ID
+      operationId: getProduct
+      parameters:
+        - name: product_id
+          in: path
+          required: true
+          schema:
+            type: string
+          example: clover-pendant
+      responses:
+        "200":
+          description: Product details
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Product"
+        "404":
+          $ref: "#/components/responses/NotFoundError"
+
+  /orders:
+    post:
+      summary: Place a new jewelry order (idempotent & rate-limited)
+      operationId: placeOrder
+      parameters:
+        - name: Idempotency-Key
+          in: header
+          required: false
+          description: >
+            Unique client-generated key (1-128 chars) to make order retries safe.
+            Repeating the same key and payload returns 200 OK with the original order.
+            Reusing the same key with a different payload returns 409 Conflict.
+          schema:
+            type: string
+            minLength: 1
+            maxLength: 128
+          example: idem_order_001
+        - name: traceparent
+          in: header
+          required: false
+          description: W3C Trace Context header for cross-service log correlation
+          schema:
+            type: string
+          example: 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/PlaceOrderRequest"
+      responses:
+        "201":
+          description: Order newly created and stock decremented
+          headers:
+            Location:
+              schema:
+                type: string
+              description: URI of the created order
+            Idempotent-Replayed:
+              schema:
+                type: string
+                enum: ["false"]
+            traceparent:
+              $ref: "#/components/headers/Traceparent"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Order"
+        "200":
+          description: Identical request replayed via Idempotency-Key (no duplicate stock deduction)
+          headers:
+            Idempotent-Replayed:
+              schema:
+                type: string
+                enum: ["true"]
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Order"
+        "400":
+          $ref: "#/components/responses/ValidationError"
+        "404":
+          $ref: "#/components/responses/NotFoundError"
+        "409":
+          $ref: "#/components/responses/ConflictError"
+        "422":
+          $ref: "#/components/responses/PaymentDeclinedError"
+        "429":
+          $ref: "#/components/responses/RateLimitError"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailableError"
+
+  /orders/{order_id}:
+    get:
+      summary: Get an existing order by ID
+      operationId: getOrder
+      parameters:
+        - name: order_id
+          in: path
+          required: true
+          schema:
+            type: string
+          example: ord_a1b2c3d4e5f6
+      responses:
+        "200":
+          description: Order details
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Order"
+        "404":
+          $ref: "#/components/responses/NotFoundError"
+
+  /orders/{order_id}/cancellations:
+    post:
+      summary: Cancel an order and restore product stock (safe to repeat)
+      operationId: cancelOrder
+      parameters:
+        - name: order_id
+          in: path
+          required: true
+          schema:
+            type: string
+          example: ord_a1b2c3d4e5f6
+      responses:
+        "200":
+          description: Order state after cancellation
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Order"
+        "404":
+          $ref: "#/components/responses/NotFoundError"
+
+components:
+  headers:
+    Traceparent:
+      description: W3C Trace Context identifier propagated into JSON logs
+      schema:
+        type: string
+
+  schemas:
+    Product:
+      type: object
+      required: [id, name, price_pkr, stock]
+      properties:
+        id:
+          type: string
+          example: clover-pendant
+        name:
+          type: string
+          example: Clover pendant
+        price_pkr:
+          type: integer
+          example: 4500
+        stock:
+          type: integer
+          minimum: 0
+          example: 50
+
+    PlaceOrderRequest:
+      type: object
+      required: [product_id, quantity, payment_token]
+      properties:
+        product_id:
+          type: string
+          example: clover-pendant
+        quantity:
+          type: integer
+          minimum: 1
+          maximum: 10
+          example: 2
+        payment_token:
+          type: string
+          pattern: "^tok_.+"
+          example: tok_visa
+
+    Order:
+      type: object
+      required: [id, product_id, quantity, total_pkr, status, created_at]
+      properties:
+        id:
+          type: string
+          example: ord_8f9d2a1b3c4e
+        product_id:
+          type: string
+          example: clover-pendant
+        quantity:
+          type: integer
+          example: 2
+        total_pkr:
+          type: integer
+          example: 9000
+        status:
+          type: string
+          enum: [placed, cancelled]
+          example: placed
+        created_at:
+          type: string
+          format: date-time
+          example: "2026-10-19T14:00:00Z"
+        cancelled_at:
+          type: string
+          format: date-time
+          nullable: true
+          example: null
+
+    ProblemDetails:
+      type: object
+      required: [type, title, status, detail, code, trace_id]
+      properties:
+        type:
+          type: string
+          format: uri
+          example: https://inora.example/problems/validation_error
+        title:
+          type: string
+          example: Bad Request
+        status:
+          type: integer
+          example: 400
+        detail:
+          type: string
+          example: quantity must be between 1 and 10
+        code:
+          type: string
+          example: validation_error
+        field:
+          type: string
+          nullable: true
+          example: quantity
+        trace_id:
+          type: string
+          example: 4bf92f3577b34da6a3ce929d0e0e4736
+
+  responses:
+    ValidationError:
+      description: Invalid input field or malformed JSON
+      content:
+        application/problem+json:
+          schema:
+            $ref: "#/components/schemas/ProblemDetails"
+    NotFoundError:
+      description: Product or order resource does not exist
+      content:
+        application/problem+json:
+          schema:
+            $ref: "#/components/schemas/ProblemDetails"
+    ConflictError:
+      description: Out of stock or Idempotency-Key reused with different request payload
+      content:
+        application/problem+json:
+          schema:
+            $ref: "#/components/schemas/ProblemDetails"
+    PaymentDeclinedError:
+      description: Payment token was declined by processor (e.g. tok_declined)
+      content:
+        application/problem+json:
+          schema:
+            $ref: "#/components/schemas/ProblemDetails"
+    RateLimitError:
+      description: Too many requests from this IP within the rate-limit window
+      headers:
+        Retry-After:
+          description: Seconds until the current rate-limit window resets
+          schema:
+            type: integer
+      content:
+        application/problem+json:
+          schema:
+            $ref: "#/components/schemas/ProblemDetails"
+    ServiceUnavailableError:
+      description: Transient server failure
+      content:
+        application/problem+json:
+          schema:
+            $ref: "#/components/schemas/ProblemDetails"

@@ -1,74 +1,363 @@
 import json
-import os
-import uuid
-import random
-import time
 import logging
-from flask import Flask, request
+import os
+import threading
+import time
+import uuid
+from flask import Flask, Response, jsonify, request, send_file
 from prometheus_client import Counter, Gauge, Histogram, Summary, generate_latest
 
+from inora_core import (
+    DomainError,
+    IdempotencyConflict,
+    NotFound,
+    OutOfStock,
+    PaymentDeclined,
+    Store,
+    ValidationFailed,
+)
+
+# ---------------- Logging Setup (A1 JSON format + W3C trace_id) ----------------
 class JsonFormatter(logging.Formatter):
     def format(self, record):
         return json.dumps({
             "time": self.formatTime(record),
-            "service_name": "inora-backend",
+            "service_name": "inora-http-api",
             "severity": record.levelname,
             "message": record.getMessage(),
-            "request_id": getattr(record, "request_id", "n/a")
+            "request_id": getattr(record, "request_id", "n/a"),
+            "trace_id": getattr(record, "trace_id", "n/a"),
+            "endpoint": getattr(record, "endpoint", "n/a"),
+            "status_code": getattr(record, "status_code", 0),
         })
 
-LOG_FILE = os.environ.get("LOG_FILE", "app.log")
+
+LOG_FILE = os.environ.get("LOG_FILE", "logs/app.log")
 os.makedirs(os.path.dirname(LOG_FILE) or ".", exist_ok=True)
-handler = logging.FileHandler(LOG_FILE)
-handler.setFormatter(JsonFormatter())
-logging.getLogger().addHandler(handler)
-logging.getLogger().setLevel(logging.INFO)
+root_logger = logging.getLogger()
+if not any(isinstance(h, logging.FileHandler) for h in root_logger.handlers):
+    file_handler = logging.FileHandler(LOG_FILE)
+    file_handler.setFormatter(JsonFormatter())
+    root_logger.addHandler(file_handler)
+root_logger.setLevel(logging.INFO)
 
-app = Flask(__name__)
+# ---------------- Prometheus Metrics (Fixed A1 gaps + bounded labels) ----------------
+HTTP_BUCKETS = (0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0)
 
-REQUEST_COUNT = Counter('app_requests_total', 'Total requests', ['method', 'endpoint', 'http_status'])
-ACTIVE_REQUESTS = Gauge('app_active_requests', 'Active requests')
-REQUEST_LATENCY = Histogram('app_request_latency_seconds', 'Request latency')
-ORDER_PROCESSING = Summary('app_order_processing_seconds', 'Time spent processing orders')
-BUSINESS_ORDERS = Counter('business_orders_total', 'Total orders placed', ['status'])
+REQUEST_COUNT = Counter(
+    "app_requests_total",
+    "Total HTTP requests across all application endpoints",
+    ["method", "endpoint", "http_status"],
+)
+ACTIVE_REQUESTS = Gauge(
+    "app_active_requests",
+    "Number of in-flight HTTP requests currently being processed",
+)
+REQUEST_LATENCY = Histogram(
+    "app_request_latency_seconds",
+    "Server-side HTTP request duration in seconds",
+    ["method", "endpoint"],
+    buckets=HTTP_BUCKETS,
+)
+ORDER_PROCESSING = Summary(
+    "app_order_processing_seconds",
+    "Time spent executing order placement business logic",
+)
+BUSINESS_ORDERS = Counter(
+    "business_orders_total",
+    "Total order business outcomes by status",
+    ["status"],
+)
+RATE_LIMIT_DECISIONS = Counter(
+    "http_rate_limit_decisions_total",
+    "Rate limiter decisions on POST /orders",
+    ["decision"],
+)
 
-@app.route('/metrics')
-def metrics():
-    return generate_latest(), 200, {'Content-Type': 'text/plain; version=0.0.4'}
+# ---------------- Rate Limiter (Fixed Window per Client IP) ----------------
+class FixedWindowRateLimiter:
+    """Single-instance thread-safe fixed-window counter per client IP.
+    Default: 5 requests per 10-second window per client IP."""
 
-@app.route('/catalog')
-@ACTIVE_REQUESTS.track_inprogress()
-@REQUEST_LATENCY.time()
-def catalog():
-    req_id = str(uuid.uuid4())[:8]
-    time.sleep(random.uniform(0.1, 0.3))
-    REQUEST_COUNT.labels('GET', '/catalog', '200').inc()
-    logging.info("Catalog endpoint accessed by user", extra={"request_id": req_id})
-    return {"items": ["clover pendant", "minimalist ring", "pearl bracelet"]}
+    def __init__(self, limit=5, window_seconds=10):
+        self.limit = limit
+        self.window_seconds = window_seconds
+        self._lock = threading.Lock()
+        self._windows = {}  # ip -> (window_start_epoch, count)
 
-@app.route('/order', methods=['POST'])
-@ACTIVE_REQUESTS.track_inprogress()
-def order():
-    req_id = str(uuid.uuid4())[:8]
-    start_time = time.time()
-    if random.random() < 0.2:
-        REQUEST_COUNT.labels('POST', '/order', '500').inc()
-        BUSINESS_ORDERS.labels('failed').inc()
-        logging.error("Payment transaction failed for order attempt", extra={"request_id": req_id})
-        return {"error": "payment_failed"}, 500
-    
-    time.sleep(random.uniform(0.2, 0.6))
-    REQUEST_COUNT.labels('POST', '/order', '200').inc()
-    BUSINESS_ORDERS.labels('success').inc()
-    ORDER_PROCESSING.observe(time.time() - start_time)
-    logging.info("Order processed successfully", extra={"request_id": req_id})
-    return {"status": "success"}
+    def check(self, client_ip, now=None):
+        now = time.time() if now is None else now
+        with self._lock:
+            window_start, count = self._windows.get(client_ip, (now, 0))
+            if now - window_start >= self.window_seconds:
+                window_start, count = now, 0
+            if count >= self.limit:
+                retry_after = max(1, int(round(self.window_seconds - (now - window_start))))
+                return False, retry_after, 0
+            count += 1
+            self._windows[client_ip] = (window_start, count)
+            remaining = self.limit - count
+            return True, 0, remaining
 
-@app.route('/cancel', methods=['POST'])
-def cancel():
-    BUSINESS_ORDERS.labels('cancelled').inc()
-    logging.info("Order cancelled by user", extra={"request_id": str(uuid.uuid4())[:8]})
-    return {"status": "cancelled"}
+    def reset(self):
+        with self._lock:
+            self._windows.clear()
 
-if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=5000)
+
+# ---------------- Domain Error -> HTTP Status Mapping ----------------
+ERROR_MAP = {
+    ValidationFailed.code: (400, "Bad Request"),
+    NotFound.code: (404, "Not Found"),
+    OutOfStock.code: (409, "Conflict"),
+    IdempotencyConflict.code: (409, "Conflict"),
+    PaymentDeclined.code: (422, "Unprocessable Content"),
+}
+
+
+def parse_or_create_trace():
+    """Extract W3C traceparent or create one. Returns (traceparent, trace_id, req_id)."""
+    tp = request.headers.get("traceparent", "").strip()
+    parts = tp.split("-")
+    if len(parts) == 4 and len(parts[1]) == 32 and len(parts[2]) == 16:
+        trace_id = parts[1]
+        span_id = parts[2]
+    else:
+        trace_id = uuid.uuid4().hex
+        span_id = uuid.uuid4().hex[:16]
+        tp = f"00-{trace_id}-{span_id}-01"
+    return tp, trace_id, trace_id[:8]
+
+
+def problem_response(status, title, detail, code, field=None, headers=None):
+    body = {
+        "type": f"https://inora.example/problems/{code}",
+        "title": title,
+        "status": status,
+        "detail": detail,
+        "code": code,
+        "trace_id": getattr(request, "_trace_id", "n/a"),
+    }
+    if field is not None:
+        body["field"] = field
+    resp = Response(
+        json.dumps(body),
+        status=status,
+        mimetype="application/problem+json",
+    )
+    if headers:
+        for k, v in headers.items():
+            resp.headers[k] = str(v)
+    return resp
+
+
+def create_app(db_path=None, rate_limit=None, rate_window=None):
+    app = Flask(__name__)
+    store = Store(db_path or os.environ.get("INORA_DB", "data/inora.db"))
+    limiter = FixedWindowRateLimiter(
+        limit=int(rate_limit or os.environ.get("RATE_LIMIT_MAX", 5)),
+        window_seconds=int(rate_window or os.environ.get("RATE_LIMIT_WINDOW", 10)),
+    )
+    app.config["STORE"] = store
+    app.config["LIMITER"] = limiter
+
+    @app.before_request
+    def _before():
+        request._start_time = time.perf_counter()
+        tp, trace_id, req_id = parse_or_create_trace()
+        request._traceparent = tp
+        request._trace_id = trace_id
+        request._req_id = req_id
+        if request.path != "/metrics":
+            ACTIVE_REQUESTS.inc()
+
+    @app.after_request
+    def _after(response):
+        response.headers["traceparent"] = getattr(request, "_traceparent", "")
+        if request.path != "/metrics":
+            ACTIVE_REQUESTS.dec()
+            # Use route template (e.g. /orders/<order_id>) so path IDs never become labels
+            route_Template = request.url_rule.rule if request.url_rule else "unmatched"
+            elapsed = time.perf_counter() - getattr(request, "_start_time", time.perf_counter())
+            REQUEST_LATENCY.labels(request.method, route_Template).observe(elapsed)
+            REQUEST_COUNT.labels(request.method, route_Template, str(response.status_code)).inc()
+        return response
+
+    @app.errorhandler(DomainError)
+    def _handle_domain_error(err):
+        status, title = ERROR_MAP.get(err.code, (400, "Domain Error"))
+        if isinstance(err, (OutOfStock, PaymentDeclined)):
+            BUSINESS_ORDERS.labels("failed").inc()
+        logging.warning(
+            f"Domain error ({err.code}): {err.message}",
+            extra={
+                "request_id": request._req_id,
+                "trace_id": request._trace_id,
+                "endpoint": request.path,
+                "status_code": status,
+            },
+        )
+        return problem_response(status, title, err.message, err.code, field=err.field)
+
+    @app.route("/metrics", methods=["GET"])
+    def metrics():
+        return generate_latest(), 200, {"Content-Type": "text/plain; version=0.0.4"}
+
+    @app.route("/openapi.yaml", methods=["GET"])
+    def openapi_spec():
+        spec_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "openapi.yaml")
+        with open(spec_path, "r", encoding="utf-8") as f:
+            return Response(f.read(), status=200, mimetype="application/yaml")
+
+    @app.route("/products", methods=["GET"])
+    def list_products():
+        items = store.list_products()
+        logging.info(
+            "Listed products catalog",
+            extra={
+                "request_id": request._req_id,
+                "trace_id": request._trace_id,
+                "endpoint": "/products",
+                "status_code": 200,
+            },
+        )
+        return jsonify({"items": items}), 200
+
+    @app.route("/products/<product_id>", methods=["GET"])
+    def get_product(product_id):
+        product = store.get_product(product_id)
+        logging.info(
+            f"Fetched product {product_id}",
+            extra={
+                "request_id": request._req_id,
+                "trace_id": request._trace_id,
+                "endpoint": "/products/<product_id>",
+                "status_code": 200,
+            },
+        )
+        return jsonify(product), 200
+
+    @app.route("/orders", methods=["POST"])
+    def place_order():
+        # 1. Rate Limit Check (5 req / 10s per IP)
+        client_ip = request.headers.get("X-Forwarded-For", request.remote_addr or "127.0.0.1")
+        allowed, retry_after, remaining = limiter.check(client_ip)
+        if not allowed:
+            RATE_LIMIT_DECISIONS.labels("rejected").inc()
+            logging.warning(
+                f"Rate limit exceeded for IP {client_ip}",
+                extra={
+                    "request_id": request._req_id,
+                    "trace_id": request._trace_id,
+                    "endpoint": "/orders",
+                    "status_code": 429,
+                },
+            )
+            return problem_response(
+                429,
+                "Too Many Requests",
+                f"Rate limit of {limiter.limit} requests per {limiter.window_seconds}s exceeded.",
+                "rate_limit_exceeded",
+                headers={
+                    "Retry-After": retry_after,
+                    "X-RateLimit-Limit": limiter.limit,
+                    "X-RateLimit-Remaining": 0,
+                },
+            )
+        RATE_LIMIT_DECISIONS.labels("allowed").inc()
+
+        # 2. Controlled Fault Injection (only when triggered by caller demo or env)
+        fault = request.headers.get("X-Simulate-Fault") or os.environ.get("FAULT_MODE", "")
+        if fault == "503":
+            BUSINESS_ORDERS.labels("failed").inc()
+            logging.error(
+                "Simulated upstream payment gateway outage (503)",
+                extra={
+                    "request_id": request._req_id,
+                    "trace_id": request._trace_id,
+                    "endpoint": "/orders",
+                    "status_code": 503,
+                },
+            )
+            return problem_response(
+                503,
+                "Service Unavailable",
+                "Temporary upstream service failure; safe to retry with Idempotency-Key.",
+                "service_unavailable",
+            )
+        if fault == "slow":
+            time.sleep(1.5)
+
+        # 3. Validate JSON Payload
+        if not request.is_json:
+            raise ValidationFailed("Request body must be valid application/json")
+        data = request.get_json(silent=True)
+        if not isinstance(data, dict):
+            raise ValidationFailed("JSON body must be an object")
+
+        idem_key = request.headers.get("Idempotency-Key")
+        start_t = time.perf_counter()
+        order, replayed = store.place_order(
+            product_id=data.get("product_id"),
+            quantity=data.get("quantity"),
+            payment_token=data.get("payment_token"),
+            idempotency_key=idem_key,
+        )
+        ORDER_PROCESSING.observe(time.perf_counter() - start_t)
+
+        status_code = 200 if replayed else 201
+        if not replayed:
+            BUSINESS_ORDERS.labels("success").inc()
+
+        logging.info(
+            f"Order {order['id']} {'replayed idempotently' if replayed else 'placed'}",
+            extra={
+                "request_id": request._req_id,
+                "trace_id": request._trace_id,
+                "endpoint": "/orders",
+                "status_code": status_code,
+            },
+        )
+        resp = jsonify(order)
+        resp.status_code = status_code
+        resp.headers["Location"] = f"/orders/{order['id']}"
+        resp.headers["Idempotent-Replayed"] = "true" if replayed else "false"
+        resp.headers["X-RateLimit-Limit"] = str(limiter.limit)
+        resp.headers["X-RateLimit-Remaining"] = str(remaining)
+        return resp
+
+    @app.route("/orders/<order_id>", methods=["GET"])
+    def get_order(order_id):
+        order = store.get_order(order_id)
+        logging.info(
+            f"Fetched order {order_id}",
+            extra={
+                "request_id": request._req_id,
+                "trace_id": request._trace_id,
+                "endpoint": "/orders/<order_id>",
+                "status_code": 200,
+            },
+        )
+        return jsonify(order), 200
+
+    @app.route("/orders/<order_id>/cancellations", methods=["POST"])
+    def cancel_order(order_id):
+        order = store.cancel_order(order_id)
+        BUSINESS_ORDERS.labels("cancelled").inc()
+        logging.info(
+            f"Order {order_id} cancelled",
+            extra={
+                "request_id": request._req_id,
+                "trace_id": request._trace_id,
+                "endpoint": "/orders/<order_id>/cancellations",
+                "status_code": 200,
+            },
+        )
+        return jsonify(order), 200
+
+    return app
+
+
+app = create_app()
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=5000, threaded=True)
