@@ -4,8 +4,9 @@ import os
 import threading
 import time
 import uuid
-from flask import Flask, Response, jsonify, request, send_file
+from flask import Flask, Response, jsonify, request
 from prometheus_client import Counter, Gauge, Histogram, Summary, generate_latest
+from werkzeug.exceptions import HTTPException
 
 from inora_core import (
     DomainError,
@@ -197,6 +198,37 @@ def create_app(db_path=None, rate_limit=None, rate_window=None):
             },
         )
         return problem_response(status, title, err.message, err.code, field=err.field)
+
+    @app.errorhandler(HTTPException)
+    def _handle_http_error(err):
+        """Routing/protocol errors (unknown URL, wrong method...) use the same
+        problem+json format as every other error."""
+        codes = {400: "bad_request", 404: "not_found", 405: "method_not_allowed",
+                 413: "payload_too_large", 415: "unsupported_media_type"}
+        resp = problem_response(err.code, err.name, err.description,
+                                codes.get(err.code, "http_error"))
+        if err.code == 405 and getattr(err, "valid_methods", None):
+            resp.headers["Allow"] = ", ".join(sorted(err.valid_methods))
+        logging.warning(
+            f"HTTP error {err.code} on {request.method} {request.path}",
+            extra={"request_id": getattr(request, "_req_id", "n/a"),
+                   "trace_id": getattr(request, "_trace_id", "n/a"),
+                   "endpoint": "unmatched" if request.url_rule is None else request.url_rule.rule,
+                   "status_code": err.code},
+        )
+        return resp
+
+    @app.errorhandler(Exception)
+    def _handle_unexpected_error(err):
+        """Last resort: never leak a Python traceback or an HTML page to the caller."""
+        logging.exception(
+            "Unhandled exception",
+            extra={"request_id": getattr(request, "_req_id", "n/a"),
+                   "trace_id": getattr(request, "_trace_id", "n/a"),
+                   "endpoint": request.path, "status_code": 500},
+        )
+        return problem_response(500, "Internal Server Error",
+                                "An unexpected error occurred.", "internal_error")
 
     @app.route("/metrics", methods=["GET"])
     def metrics():

@@ -22,11 +22,15 @@ DECLINED_TOKEN = "tok_declined"      # deterministic payment failure for demos a
 TOKEN_PREFIX = "tok_"
 MAX_KEY_LENGTH = 128
 
+# Stock for the three regular products. Tests use the default (50); the Docker demo sets a
+# much larger INORA_SEED_STOCK so traffic.py does not sell the shop out after a few minutes.
+DEFAULT_STOCK = int(os.environ.get("INORA_SEED_STOCK", "50"))
+
 SEED_PRODUCTS = [
     # id, name, price in PKR, stock
-    ("clover-pendant", "Clover pendant", 4500, 50),
-    ("minimalist-ring", "Minimalist ring", 3200, 50),
-    ("pearl-bracelet", "Pearl bracelet", 5800, 50),
+    ("clover-pendant", "Clover pendant", 4500, DEFAULT_STOCK),
+    ("minimalist-ring", "Minimalist ring", 3200, DEFAULT_STOCK),
+    ("pearl-bracelet", "Pearl bracelet", 5800, DEFAULT_STOCK),
     ("limited-necklace", "Limited edition necklace", 12000, 1),   # scarce item for out-of-stock demos
 ]
 

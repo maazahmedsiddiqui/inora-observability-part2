@@ -7,9 +7,10 @@ services:
     environment:
       - LOG_FILE=/app/logs/app.log
       - INORA_DB=/app/data/inora.db
+      - INORA_SEED_STOCK=100000
     volumes:
       - ./logs:/app/logs
-      - ./data:/app/data
+      - inora-data:/app/data
 
   prometheus:
     image: prom/prometheus:latest
@@ -68,3 +69,6 @@ services:
       - ./logs:/usr/share/filebeat/logs:ro
     depends_on:
       - elasticsearch
+
+volumes:
+  inora-data:

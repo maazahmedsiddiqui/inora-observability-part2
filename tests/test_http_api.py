@@ -142,3 +142,33 @@ def test_openapi_spec_matches_registered_routes(client):
             flask_paths.add(normalized)
 
     assert spec_paths == flask_paths
+
+
+# ---- A2: consistent error format also for routing / protocol / malformed-body errors ----
+def test_unknown_url_returns_problem_json(client):
+    r = client.get("/no-such-page")
+    assert r.status_code == 404
+    assert r.content_type.startswith("application/problem+json")
+    assert r.get_json()["code"] == "not_found"
+
+
+def test_wrong_method_returns_problem_json_with_allow_header(client):
+    r = client.put("/orders", json={})
+    assert r.status_code == 405
+    assert r.content_type.startswith("application/problem+json")
+    assert r.get_json()["code"] == "method_not_allowed"
+    assert "POST" in r.headers["Allow"]
+
+
+def test_malformed_json_body_returns_400_problem_json(client):
+    r = client.post("/orders", data="{not json", content_type="application/json")
+    assert r.status_code == 400
+    assert r.content_type.startswith("application/problem+json")
+    assert r.get_json()["code"] == "validation_error"
+
+
+def test_missing_json_content_type_returns_400_problem_json(client):
+    r = client.post("/orders", data="product_id=x", content_type="text/plain")
+    assert r.status_code == 400
+    assert r.get_json()["code"] == "validation_error"
+

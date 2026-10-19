@@ -4,3 +4,5 @@ app.log
 logs/
 .pytest_cache/
 *.db
+data/
+*.pyc
