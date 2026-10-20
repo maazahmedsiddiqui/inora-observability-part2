@@ -5,6 +5,6 @@ RUN pip install --no-cache-dir -r requirements-grpc.txt
 COPY inora_core/ ./inora_core/
 COPY inora_obs/ ./inora_obs/
 COPY inora/ ./inora/
-COPY grpc_server.py .
-EXPOSE 50051
+COPY grpc_metrics.py grpc_server.py ./
+EXPOSE 50051 9102
 CMD ["python", "grpc_server.py"]

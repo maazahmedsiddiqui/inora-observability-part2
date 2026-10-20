@@ -14,12 +14,14 @@ import time
 from concurrent import futures
 
 import grpc
+from prometheus_client import start_http_server
 
 from inora.v1 import inora_pb2, inora_pb2_grpc
 from inora_core import (
     DomainError, IdempotencyConflict, NotFound, OutOfStock, PaymentDeclined, Store, ValidationFailed,
 )
 from inora_obs import make_traceparent, parse_traceparent, setup_file_logging
+import grpc_metrics
 
 log = logging.getLogger("inora.grpc")
 
@@ -67,6 +69,8 @@ class OrderService(inora_pb2_grpc.OrderServiceServicer):
             )
         except DomainError as err:
             status = GRPC_STATUS_MAP.get(err.code, grpc.StatusCode.INVALID_ARGUMENT)
+            if isinstance(err, (OutOfStock, PaymentDeclined)):      # same rule as the HTTP API
+                grpc_metrics.BUSINESS_ORDERS.labels("failed").inc()
             level = logging.ERROR if isinstance(err, PaymentDeclined) else logging.WARNING
             log.log(level, f"Domain error ({err.code}): {err.message}",
                     extra={**ctx, "status_code": status.value[0]})
@@ -77,13 +81,17 @@ class OrderService(inora_pb2_grpc.OrderServiceServicer):
             context.set_trailing_metadata((("error-code", "internal_error"), ("traceparent", traceparent)))
             context.abort(grpc.StatusCode.INTERNAL, "An unexpected error occurred.")
 
+        if not replayed:
+            grpc_metrics.BUSINESS_ORDERS.labels("success").inc()
         log.info(f"Order {order['id']} {'replayed idempotently' if replayed else 'placed'}",
                  extra={**ctx, "status_code": 0})
         return inora_pb2.PlaceOrderResponse(order=_order_to_message(order), replayed=replayed)
 
 
 def build_server(store, port=50051, max_workers=10, simulate_delay_s=0.0):
-    server = grpc.server(futures.ThreadPoolExecutor(max_workers=max_workers))
+    server = grpc.server(futures.ThreadPoolExecutor(max_workers=max_workers),
+                         interceptors=[grpc_metrics.MetricsInterceptor({("inora.v1.OrderService", "PlaceOrder")})])
+    grpc_metrics.seed_series("inora.v1.OrderService", "PlaceOrder")
     inora_pb2_grpc.add_OrderServiceServicer_to_server(OrderService(store, simulate_delay_s), server)
     bound = server.add_insecure_port(f"[::]:{port}")
     return server, bound
@@ -93,10 +101,13 @@ def main():
     setup_file_logging("inora-grpc", os.environ.get("LOG_FILE", "logs/grpc.log"))
     store = Store(os.environ.get("INORA_DB", "data/inora.db"))
     port = int(os.environ.get("GRPC_PORT", "50051"))
+    metrics_port = int(os.environ.get("METRICS_PORT", "9102"))
+    grpc_metrics.GRPC_REGISTRY.register(grpc_metrics.StockCollector(store))
+    start_http_server(metrics_port, registry=grpc_metrics.GRPC_REGISTRY)     # Prometheus scrapes this
     server, bound = build_server(store, port, simulate_delay_s=float(os.environ.get("GRPC_SIMULATE_DELAY", "0")))
     server.start()
     log.info(f"gRPC server listening on port {bound}", extra={"endpoint": "startup"})
-    print(f"inora-grpc listening on :{bound}", flush=True)
+    print(f"inora-grpc listening on :{bound}, metrics on :{metrics_port}", flush=True)
     stop = server.wait_for_termination
     signal.signal(signal.SIGTERM, lambda *_: server.stop(grace=5))
     try:

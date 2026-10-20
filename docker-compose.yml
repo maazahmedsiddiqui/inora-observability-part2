@@ -21,8 +21,11 @@ services:
     container_name: inora-grpc
     ports:
       - "50051:50051"
+      - "9102:9102"
     environment:
       - LOG_FILE=/app/logs/grpc.log
+      - METRICS_PORT=9102
+      - GRPC_SIMULATE_DELAY=${GRPC_SIMULATE_DELAY:-0}
       - INORA_DB=/app/data/inora.db
       - INORA_SEED_STOCK=100000
     volumes:
@@ -44,6 +47,9 @@ services:
     container_name: grafana
     ports:
       - "3000:3000"
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
     environment:
       - GF_SECURITY_ADMIN_USER=admin
       - GF_SECURITY_ADMIN_PASSWORD=admin

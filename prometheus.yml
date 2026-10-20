@@ -6,6 +6,10 @@ scrape_configs:
     static_configs:
       - targets: ['api:5000']
 
+  - job_name: 'inora_grpc'
+    static_configs:
+      - targets: ['grpc:9102']
+
   - job_name: 'node_exporter'
     static_configs:
       - targets: ['node-exporter:9100']
