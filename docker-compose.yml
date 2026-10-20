@@ -14,6 +14,23 @@ services:
       - ./logs:/app/logs
       - inora-data:/app/data
 
+  grpc:
+    build:
+      context: .
+      dockerfile: Dockerfile.grpc
+    container_name: inora-grpc
+    ports:
+      - "50051:50051"
+    environment:
+      - LOG_FILE=/app/logs/grpc.log
+      - INORA_DB=/app/data/inora.db
+      - INORA_SEED_STOCK=100000
+    volumes:
+      - ./logs:/app/logs
+      - inora-data:/app/data
+    depends_on:
+      - api
+
   prometheus:
     image: prom/prometheus:latest
     container_name: prometheus

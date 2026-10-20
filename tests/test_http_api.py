@@ -188,3 +188,25 @@ def test_repeated_cancel_counts_once_in_business_metric(client):
     client.post(f"/orders/{placed['id']}/cancellations")
     client.post(f"/orders/{placed['id']}/cancellations")
     assert cancelled() - before == 1
+
+
+# ---- Logs: a declined payment is ERROR on the HTTP side too (same as gRPC), other rejections are WARNING ----
+def test_declined_payment_is_logged_at_error_and_validation_at_warning(client):
+    import logging
+
+    seen = []
+
+    class H(logging.Handler):
+        def emit(self, record):
+            seen.append((record.levelno, record.getMessage()))
+
+    h = H()
+    logging.getLogger().addHandler(h)
+    try:
+        client.post("/orders", json={"product_id": "clover-pendant", "quantity": 1, "payment_token": "tok_declined"})
+        client.post("/orders", json={"product_id": "clover-pendant", "quantity": 0, "payment_token": "tok_visa"})
+    finally:
+        logging.getLogger().removeHandler(h)
+    declined = [lv for lv, m in seen if "payment_declined" in m]
+    invalid = [lv for lv, m in seen if "validation_error" in m]
+    assert declined == [logging.ERROR] and invalid == [logging.WARNING]

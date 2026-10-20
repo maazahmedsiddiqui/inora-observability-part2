@@ -65,7 +65,7 @@ class Store:
         with self._conn() as c:
             c.executescript(SCHEMA)
             if c.execute("SELECT COUNT(*) FROM products").fetchone()[0] == 0:
-                c.executemany("INSERT INTO products VALUES (?,?,?,?)", SEED_PRODUCTS)
+                c.executemany("INSERT OR IGNORE INTO products VALUES (?,?,?,?)", SEED_PRODUCTS)
 
     def _conn(self):
         c = sqlite3.connect(self.path, timeout=10, isolation_level=None)

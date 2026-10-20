@@ -8,6 +8,8 @@ from flask import Flask, Response, jsonify, request
 from prometheus_client import Counter, Gauge, Histogram, Summary, generate_latest
 from werkzeug.exceptions import HTTPException
 
+from inora_obs import setup_file_logging
+
 from inora_core import (
     DomainError,
     IdempotencyConflict,
@@ -18,32 +20,9 @@ from inora_core import (
     ValidationFailed,
 )
 
-# ---------------- Logging Setup (A1 JSON format + W3C trace_id) ----------------
-class JsonFormatter(logging.Formatter):
-    def format(self, record):
-        return json.dumps({
-            "time": self.formatTime(record),
-            "service_name": "inora-http-api",
-            "severity": record.levelname,
-            "message": record.getMessage(),
-            "request_id": getattr(record, "request_id", "n/a"),
-            "trace_id": getattr(record, "trace_id", "n/a"),
-            "endpoint": getattr(record, "endpoint", "n/a"),
-            "status_code": getattr(record, "status_code", 0),
-        })
-
-
+# ---------------- Logging Setup (A1 JSON format + W3C trace_id; shared with the gRPC service) ----------------
 LOG_FILE = os.environ.get("LOG_FILE", "logs/app.log")
-os.makedirs(os.path.dirname(LOG_FILE) or ".", exist_ok=True)
-root_logger = logging.getLogger()
-if not any(isinstance(h, logging.FileHandler) for h in root_logger.handlers):
-    file_handler = logging.FileHandler(LOG_FILE)
-    file_handler.setFormatter(JsonFormatter())
-    root_logger.addHandler(file_handler)
-root_logger.setLevel(logging.INFO)
-# Werkzeug's own access-log lines (one per Prometheus scrape) have no request_id/trace_id; the
-# app writes its own structured line per request, so silence the duplicate.
-logging.getLogger("werkzeug").setLevel(logging.WARNING)
+setup_file_logging("inora-http-api", LOG_FILE)
 
 # ---------------- Prometheus Metrics (Fixed A1 gaps + bounded labels) ----------------
 HTTP_BUCKETS = (0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0)
@@ -191,7 +170,10 @@ def create_app(db_path=None, rate_limit=None, rate_window=None):
         status, title = ERROR_MAP.get(err.code, (400, "Domain Error"))
         if isinstance(err, (OutOfStock, PaymentDeclined)):
             BUSINESS_ORDERS.labels("failed").inc()
-        logging.warning(
+        # A declined payment is a failed order: log it at ERROR (as in Assignment 1) so Kibana's
+        # `severity: ERROR` search finds it, exactly as it does for the gRPC service.
+        logging.log(
+            logging.ERROR if isinstance(err, PaymentDeclined) else logging.WARNING,
             f"Domain error ({err.code}): {err.message}",
             extra={
                 "request_id": request._req_id,

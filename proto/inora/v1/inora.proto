@@ -1,0 +1,50 @@
+// Inora order service (Assignment 2, Part B).
+//
+// One operation - PlaceOrder - is offered over gRPC. The HTTP API (POST /orders) keeps working.
+// Both call the same business module (inora_core.Store) and the same SQLite database.
+//
+// Generate the Python code from the project root with:
+//   python -m grpc_tools.protoc -I proto --python_out=. --grpc_python_out=. proto/inora/v1/inora.proto
+syntax = "proto3";
+
+package inora.v1;
+
+service OrderService {
+  // Places an order. Unary: one request, one response.
+  //
+  // Client metadata:   traceparent   (optional)  W3C trace context; copied into the server's logs.
+  // Server trailing metadata on errors:  error-code  (stable domain code, e.g. "out_of_stock")
+  //                                      traceparent
+  //
+  // Status codes (same rules as the HTTP API, translated):
+  //   OK                   order created, or an earlier identical request replayed (see `replayed`)
+  //   INVALID_ARGUMENT     input breaks a rule                 (HTTP 400)
+  //   NOT_FOUND            unknown product                     (HTTP 404)
+  //   FAILED_PRECONDITION  payment declined                    (HTTP 422)
+  //   RESOURCE_EXHAUSTED   not enough stock                    (HTTP 409)
+  //   ALREADY_EXISTS       idempotency key reused differently  (HTTP 409)
+  //   DEADLINE_EXCEEDED    the client's deadline passed        (HTTP: client timeout)
+  //   INTERNAL             unexpected server error             (HTTP 500)
+  rpc PlaceOrder(PlaceOrderRequest) returns (PlaceOrderResponse);
+}
+
+message PlaceOrderRequest {
+  string product_id = 1;
+  int32 quantity = 2;            // 1..10
+  string payment_token = 3;      // must look like "tok_..."; "tok_declined" is always declined
+  string idempotency_key = 4;    // optional; makes retries safe (1..128 characters)
+}
+
+message PlaceOrderResponse {
+  Order order = 1;
+  bool replayed = 2;             // true when an earlier identical request already created this order
+}
+
+message Order {
+  string id = 1;
+  string product_id = 2;
+  int32 quantity = 3;
+  int64 total_pkr = 4;
+  string status = 5;             // "placed" or "cancelled"
+  string created_at = 6;         // UTC, ISO 8601
+}
