@@ -123,6 +123,8 @@ paths:
           $ref: "#/components/responses/PaymentDeclinedError"
         "429":
           $ref: "#/components/responses/RateLimitError"
+        "500":
+          $ref: "#/components/responses/InternalError"
         "503":
           $ref: "#/components/responses/ServiceUnavailableError"
 
@@ -301,12 +303,26 @@ components:
           description: Seconds until the current rate-limit window resets
           schema:
             type: integer
+        X-RateLimit-Limit:
+          description: Requests allowed per window per client address
+          schema:
+            type: integer
+        X-RateLimit-Remaining:
+          description: Requests left in the current window (0 when rejected)
+          schema:
+            type: integer
       content:
         application/problem+json:
           schema:
             $ref: "#/components/schemas/ProblemDetails"
     ServiceUnavailableError:
       description: Transient server failure
+      content:
+        application/problem+json:
+          schema:
+            $ref: "#/components/schemas/ProblemDetails"
+    InternalError:
+      description: Unexpected server error (never a stack trace or HTML page)
       content:
         application/problem+json:
           schema:

@@ -142,6 +142,9 @@ def create_app(db_path=None, rate_limit=None, rate_window=None):
     )
     app.config["STORE"] = store
     app.config["LIMITER"] = limiter
+    # Opt-in CORS: only when CORS_ALLOW_ORIGIN is set (docker-compose sets it to the Swagger UI origin), so a
+    # browser page on another port may call this API. Unset = no cross-origin access (the default).
+    cors_origin = os.environ.get("CORS_ALLOW_ORIGIN", "").strip()
 
     @app.before_request
     def _before():
@@ -156,6 +159,12 @@ def create_app(db_path=None, rate_limit=None, rate_window=None):
     @app.after_request
     def _after(response):
         response.headers["traceparent"] = getattr(request, "_traceparent", "")
+        if cors_origin:
+            response.headers["Access-Control-Allow-Origin"] = cors_origin
+            response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+            response.headers["Access-Control-Allow-Headers"] = "Content-Type, Idempotency-Key, traceparent"
+            response.headers["Access-Control-Expose-Headers"] = (
+                "Location, Idempotent-Replayed, Retry-After, X-RateLimit-Limit, X-RateLimit-Remaining, traceparent")
         if request.path != "/metrics":
             ACTIVE_REQUESTS.dec()
             # Use route template (e.g. /orders/<order_id>) so path IDs never become labels
